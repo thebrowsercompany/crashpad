@@ -9,6 +9,8 @@ add_library(crashpad_handler_lib STATIC
     prune_crash_reports_thread.h
     user_stream_data_source.cc
     user_stream_data_source.h
+    ../../../vendor/mpack.c
+    ../../../vendor/mpack.h
 )
 
 if(APPLE)
@@ -65,7 +67,7 @@ target_link_libraries(crashpad_handler_lib
 if(WIN32)
     if(MSVC)
         target_link_libraries(crashpad_handler_lib PUBLIC crashpad_getopt)
-        target_compile_options(crashpad_handler_lib PRIVATE "/wd4201")
+        target_compile_options(crashpad_handler_lib PRIVATE "/wd4201" "/wd4310" "/wd4702")
     endif()
 endif()
 

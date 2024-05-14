@@ -49,6 +49,10 @@
 #include "util/ios/scoped_background_task.h"
 #endif  // BUILDFLAG(IS_IOS)
 
+#if BUILDFLAG(IS_WIN)
+#include "../../vendor/mpack.h"  // BCNY_ARC
+#endif
+
 namespace crashpad {
 
 namespace {
@@ -281,6 +285,190 @@ void CrashReportUploadThread::ProcessPendingReport(
   }
 }
 
+// START BCNY_ARC
+static bool ReadEntireFile(FileReader* reader, std::string* contents) {
+  char buffer[4096];
+  std::string local_contents;
+  FileOperationResult rv;
+  while ((rv = reader->Read(buffer, sizeof(buffer))) > 0) {
+    local_contents.append(buffer, rv);
+  }
+  if (rv < 0) {
+    return false;
+  }
+  contents->swap(local_contents);
+  return true;
+}
+
+static void AppendStringJsonQuoted(std::string* into,
+                                   const char* data,
+                                   size_t len) {
+  into->append("\"");
+  for (size_t i = 0; i < len; ++i) {
+    char c = data[i];
+    if (c < ' ' || c == '"' || c  == '\\') {
+      char buf[10];
+      // Since this isn't for human consumption, no need for \\n-style.
+      snprintf(buf, sizeof(buf), "\\u%04x", c);
+      into->append(buf);
+      continue;
+    }
+    into->append(1, c);
+  }
+  into->append("\"");
+}
+
+// This a conversion from mpack node trees to JSON as string. Specific fields
+// are overridden while constructing the final JSON string, in particular:
+// 1) at the root, "level" is overridden to "error" (rather than "fatal")
+// 2) inside the "tags" dict found at the root, a "process_type" entry is added
+//    corresponding to |ptype|.
+static bool ToJsonWithOverrides(mpack_node_t node,
+                                const std::string& ptype,
+                                const std::vector<std::string>& path_to_here,
+                                std::string* into) {
+  DCHECK(ptype != "");
+  switch (mpack_node_tag(node).type) {
+    case mpack_type_nil:
+      into->append("null");
+      return true;
+    case mpack_type_bool:
+      into->append(mpack_node_bool(node)? "true":"false");
+      return true;
+    case mpack_type_int: {
+      // See sentry__jsonwriter_write_int32().
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%" PRId32, mpack_node_i32(node));
+      into->append(buf);
+      return true;
+    }
+    case mpack_type_double: {
+      // See sentry__jsonwriter_write_double().
+      char buf[24];
+      double val = mpack_node_double(node);
+      int written = snprintf(buf, sizeof(buf), "%.16g", val);
+      if (written < 0 || written >= (int)sizeof(buf) || !isfinite(val)) {
+        into->append("null");
+      } else {
+        buf[written] = '\0';
+        into->append(buf);
+      }
+      return true;
+    }
+    case mpack_type_str: {
+      if (path_to_here.size() == 1 &&
+          path_to_here[0] == "level") {
+        // Override: Any child process, mark as non-fatal.
+        static const char kError[] = "error";
+        AppendStringJsonQuoted(into, kError, strlen(kError));
+      } else {
+        AppendStringJsonQuoted(into, mpack_node_str(node), mpack_node_strlen(node));
+      }
+      return true;
+                         }
+    case mpack_type_array: {
+      into->append("[");
+      for (size_t i = 0; i < mpack_node_array_length(node); ++i) {
+        mpack_node_t elem = mpack_node_array_at(node, i);
+
+        std::vector<std::string> new_path = path_to_here;
+        char buf[16];
+        snprintf(buf, sizeof(buf), ".%llu", i);
+        new_path.push_back(buf);
+        ToJsonWithOverrides(elem, ptype, new_path, into);
+
+        if (i < mpack_node_array_length(node) - 1) {
+          into->append(",");
+        }
+      }
+      into->append("]");
+      return true;
+    }
+    case mpack_type_map: {
+      into->append("{");
+      for (size_t i = 0; i < mpack_node_map_count(node); ++i) {
+        mpack_node_t key = mpack_node_map_key_at(node, i);
+        mpack_node_t value = mpack_node_map_value_at(node, i);
+
+        AppendStringJsonQuoted(
+            into, mpack_node_str(key), mpack_node_strlen(key));
+        into->append(":");
+
+        std::vector<std::string> new_path = path_to_here;
+        new_path.push_back(
+            std::string(mpack_node_str(key), mpack_node_strlen(key)));
+        ToJsonWithOverrides(value, ptype, new_path, into);
+
+        if (i < mpack_node_map_count(node) - 1) {
+          into->append(",");
+        }
+      }
+
+      // Override: Any child process, append ptype as a tag.
+      if (path_to_here.size() == 1 &&
+          path_to_here[0] == "tags") {
+        if (mpack_node_map_count(node) > 0) {
+          into->append(",");
+        }
+        into->append("\"process_type\":");
+        AppendStringJsonQuoted(into, ptype.data(), ptype.size());
+      }
+
+      into->append("}");
+      return true;
+    }
+
+    default:
+      // There are other msgpack types, but they are not written by Sentry.
+      NOTREACHED();
+      return false;
+  }
+}
+
+// sentry-native only supports a single set of tags, which previously are
+// applied to browser crashes. Sentry's "event" data is written to a msgpack-d
+// file, which is then attached by Crashpad to the minidump upload. This event
+// data is treated as the entire set of event tags, and additional form-data
+// additions during the HTTP POST are ignored, so we are unable to add fields.
+// In particular, we cannot set a tag that indicates that this is the crash of a
+// child process. To work around this, rather than just attaching the file
+// directly, we load it, add the the special keys required for child processes
+// where necessary, and then attach the event data as json form-data rather a
+// file attachment.
+static bool HandleEventAttachment(HTTPMultipartBuilder& http_multipart_builder,
+                                  const std::string& ptype,
+                                  FileReader* reader) {
+  DCHECK(ptype != "");
+
+  // Start by loading and deserializing the __sentry-event file.
+  std::string event_file_contents;
+  if (!ReadEntireFile(reader, &event_file_contents)) {
+    return false;
+  }
+
+  mpack_tree_t tree;
+  mpack_tree_init_data(
+      &tree, event_file_contents.data(), event_file_contents.size());
+  mpack_tree_parse(&tree);
+  mpack_node_t root = mpack_tree_root(&tree);
+
+  // Convert the tree to JSON, updating child process fields as we go.
+  std::string as_json;
+  if (!ToJsonWithOverrides(root, ptype, std::vector<std::string>(), &as_json)) {
+    return false;
+  }
+
+  if (mpack_tree_destroy(&tree) != mpack_ok) {
+    return false;
+  }
+
+  // Attach the full (modified) sentry data to the http request.
+  http_multipart_builder.SetFormData("sentry", as_json);
+
+  return true;
+}
+// END BCNY_ARC
+
 CrashReportUploadThread::UploadResult CrashReportUploadThread::UploadReport(
     const CrashReportDatabase::UploadReport* report,
     std::string* response_body) {
@@ -320,9 +508,34 @@ CrashReportUploadThread::UploadResult CrashReportUploadThread::UploadReport(
     }
   }
 
-  for (const auto& it : report->GetAttachments()) {
-    http_multipart_builder.SetFileAttachment(
-        it.first, it.first, it.second, "application/octet-stream");
+  bool attachments_handled = false;
+
+  const auto ptype_it = parameters.find("ptype");
+  if (ptype_it != parameters.end()) {
+    // This is a child process:
+    // 1) Modify the Sentry event attachment to update tags for the child
+    //    process.
+    // 2) Don't attach the other attachments (breadcrumbs) as that causes the
+    //    Sentry server to ignore the event data we pass here.
+    for (const auto& it : report->GetAttachments()) {
+      if (it.first == "__sentry-event") {
+        if (HandleEventAttachment(
+                http_multipart_builder, ptype_it->second, it.second)) {
+          attachments_handled = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // If this is the browser, or if we failed to update the tags for child due to
+  // a failure to load/parse the msgpack, then attach as normal. It will look
+  // like a browser crash in that case, but might give us a clue to investigate.
+  if (!attachments_handled) {
+    for (const auto& it : report->GetAttachments()) {
+      http_multipart_builder.SetFileAttachment(
+          it.first, it.first, it.second, "application/octet-stream");
+    }
   }
 
   http_multipart_builder.SetFileAttachment(kMinidumpKey,
